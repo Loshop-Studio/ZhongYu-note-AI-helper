@@ -1,0 +1,6 @@
+# 云笔记遥控器 —— 运行依赖
+# Python 3.10+（需要 tkinter，Windows 官方安装包默认自带）
+
+pycryptodome>=3.19.0
+pillow>=10.0.0
+pystray>=0.19.5

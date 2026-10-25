@@ -1,0 +1,44 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行产物
+_out/
+*.log
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 本机凭据与配置（绝对不要提交）
+# ⚠️ zy_credentials.example.json 是给新人的模板，故意不忽略
+config.json
+zy_credentials.json
+deepseek_key.txt
+control_state.json
+credit_baseline.json
+token_cache.json
+chat_history.json
+dirfail.marker
+
+# 备份与历史文件
+*.bak
+*.bak-*
+_bak_tmp.py
+_zy_upload_patched.py
+zy_upload_exp.py
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
