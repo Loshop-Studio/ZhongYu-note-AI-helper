@@ -17,7 +17,7 @@ control_bot.py —— 云笔记「控制」遥控器
     python control_bot.py             # 扫一次（正常由 Windows 计划任务调用）
     python control_bot.py --dry       # 只打印将要发的内容，不写回云端
     python control_bot.py --force     # 忽略"已处理"记录，强制重跑最新一条
-    python control_bot.py -h          # 命令行参数说明（指令字典在云笔记里发「帮助」）
+    python control_bot.py -h          # 命令行参数说明（指令字典在云笔记里发「/帮助」）
 """
 
 import argparse
@@ -89,6 +89,26 @@ def _child_cmd(name, extra):
     if getattr(sys, "frozen", False):
         return [sys.executable, "--child", name] + list(extra)
     return [PY, "-B", os.path.join(HERE, _CHILD_FILES[name])] + list(extra)
+def _missing_child_file(cmd):
+    """启动子进程前，先确认「要跑的那个东西」还在。
+
+    2026-10-25 的教训：exe 被替换后，正在跑的进程还攥着旧路径，
+    每次启动子进程都 FileNotFoundError。而日志只记了异常类型
+    （`上传异常 FileNotFoundError(...)`），看不出缺的是哪个文件，
+    查了很久才定位到是子进程路径失效。
+
+    现在直接点名：缺哪个文件、完整命令是什么，都写进日志。
+    """
+    for part in (cmd or []):
+        s = str(part or "")
+        if not s or s.startswith("-"):
+            continue
+        if os.path.isabs(s) or ("/" in s) or ("\\" in s):
+            if not os.path.exists(s):
+                return s
+    return None
+
+
 # ⚠️ 子进程一律不弹控制台。
 # 计划任务用 pythonw（无窗）启动本脚本，但子进程是 python.exe（控制台程序），
 # Windows 会给它分配一个新的黑窗口 —— 截图时正好把它拍进去（2026-10-17 用户发现）。
@@ -116,6 +136,10 @@ def _find_workbuddy():
 WORKBUDDY_EXE = _find_workbuddy()
 ACCEL_PORTS = (7897, 7890, 10809, 10808)
 MAX_HISTORY = 300                                   # 状态文件里最多记多少条已处理
+
+# 全功能(agent)模式每天最多处理多少条 —— 防模型犯轴把余额烧光。
+# 超了不会瘫痪：自动降级成普通模式继续干活，只是不能组合多个动作了。
+AGENT_DAILY_LIMIT = 100
 
 
 def _base_dir():
@@ -160,16 +184,49 @@ CMDS = [
 ]
 
 
+# ------------------------------------------------------------------ 指令前缀（硬性）
+# 2026-10-31 改：以前是纯关键词匹配，问「什么是状态机」「日报里那个词啥意思」
+# 都会被当成指令劫持执行。现在**只有以斜杠开头的标题才算指令**，
+# 不带斜杠的一律走「看图 / 聊天」，绝不执行任何动作。
+# 宁可漏执行（你再加个斜杠就行），也不误执行。
+CMD_PREFIXES = ("/", "／")          # 半角 + 全角（中文输入法容易打出全角）
+
+
+def is_command(text):
+    """标题是不是一条指令（必须以 / 或 ／ 开头）"""
+    s = str(text or "").lstrip()
+    return bool(s) and s[0] in CMD_PREFIXES
+
+
 def norm(s):
-    """把笔记名规范化：去掉空白、包裹符号、标点，方便宽松匹配。"""
+    """把笔记名规范化：去掉空白、包裹符号、标点，方便宽松匹配。
+
+    ⚠️ 注意它会把开头的 `/` 一并 strip 掉，所以判断"是不是指令"
+       必须在 norm **之前**做（见 is_command）。
+    """
     s = str(s or "")
     s = re.sub(r"[\s\u3000]+", "", s)
     s = s.strip("【】[]()（）<>《》「」『』\"'“”‘’:：?？!！。.,，、-_/\\|~～*#")
     return s.lower()
 
 
-def match_cmd(name):
-    """返回指令名 / None"""
+def match_cmd(name, require_slash=True):
+    """返回指令名 / None。
+
+    require_slash=True（全功能 / 普通模式）：
+        只有以 `/` 开头的标题才算指令（见 is_command）。
+        这样问「什么是状态机」不会被当成「状态」指令劫持。
+
+    require_slash=False（仅控制模式）：
+        不带斜杠也认，**保持原来的老用法**。
+        这个模式本来就不聊天，不存在"问问题被当指令"的问题，
+        所以没必要逼用户加斜杠。
+
+    不管哪种模式，norm() 都会把开头的 `/` 去掉，所以 `/状态` 和 `状态`
+    在词表匹配阶段是同一个东西。
+    """
+    if require_slash and not is_command(name):
+        return None
     n = norm(name)
     if not n:
         return None
@@ -204,6 +261,14 @@ def match_cmd(name):
         return "mode_full"
     if "仅控制" in n or "只控制" in n or "关闭聊天" in n or "禁止聊天" in n:
         return "mode_control"
+    # 普通模式 = 原版行为（关键词动作 + 聊天兜底）。「仅聊天」当同义词收着，
+    # 因为改名前用户可能已经这么叫惯了。
+    if ("普通模式" in n or "仅聊天" in n or "只聊天" in n
+            or "普通版" in n or n == "普通"):
+        return "mode_chat"
+    # 全功能次数用完时的手动解封
+    if "重置agent次数" in n or "重置次数" in n or ("重置" in n and "agent" in n):
+        return "agent_reset"
     if ("频率" in n or "间隔" in n) and pick_number(n) is not None:
         return "set_freq"
     if any(k in n for k in ("token", "字数", "长度", "回答上限")) \
@@ -235,7 +300,8 @@ DS_KEY_FILE = os.path.join(_base_dir(), "deepseek_key.txt")
 DS_API = "https://api.deepseek.com/v1/chat/completions"
 DS_TIMEOUT = 25
 DS_TOOLS = ("state", "daily", "quota", "shot", "click", "restart", "help",
-            "dashboard", "mode_full", "mode_control", "set_freq")
+            "dashboard", "mode_full", "mode_control", "mode_chat",
+            "set_freq", "set_think", "set_maxtok", "agent_reset")
 
 DS_SYSTEM = """你是家庭电脑遥控器的指令分类器。根据用户在云笔记标题里写的那句话，
 从下面的动作里选一个最合适的。只输出 JSON，不要任何解释：{"tool":"名字"}
@@ -249,9 +315,17 @@ DS_SYSTEM = """你是家庭电脑遥控器的指令分类器。根据用户在�
 - restart  重启 WorkBuddy 程序
 - help     查看指令字典
 - dashboard    查看/打开设置面板（当前模式、检查频率、上次巡检时间）
-- mode_full    切换到全功能模式（允许聊天、答题）
-- mode_control 切换到仅控制模式（只执行指令，不聊天、不答题）
+- mode_full    切到全功能（agent）模式：一句话能组合多个动作，会反复调 DeepSeek，费钱
+- mode_control 切到仅控制模式：只执行指令，不聊天、不答题、不跑 agent
+- mode_chat    切到普通模式（原版行为）：关键词执行 + 聊天兜底，一句话只办一件事
+- agent_reset  把「今天已经用掉多少次全功能」清零
 - set_freq     调整检查频率（用户在句子里说了具体几分钟）
+- set_think    调整「思考强度」这个设置，共四档：关 / 低 / 标准 / 最高。
+               只有用户明确要改这个设置时才选，例如「把思考调到最高」「思考关掉」
+               「思考改低一点」。
+               用户说「你思考一下这道题」「深度思考一下」不是改设置，绝对不要选它。
+- set_maxtok   调整「回答长度上限」，用户句子里必须带具体数字，
+               例如「字数改成 3000」「上限调到 5000」
 - none     都不属于上面任何一类
 
 如果是 click，必须带上目标，输出 {"tool":"click","target":"要点的那个东西"}，
@@ -315,6 +389,28 @@ def ds_intent(text):
         return None, None
 
 
+def looks_like_command(text):
+    """「像指令、但忘了加斜杠」—— 只用来给提示，**绝不执行**。
+
+    体验兜底：你只写「状态」「日报」这种单个词、又没加斜杠时，
+    回一句「要先加 /」，而不是让聊天模型答非所问。
+    注意这里只做**整词相等**判断，不做包含匹配 ——
+    否则「什么是状态机」又会被误判了。
+    """
+    n = norm(text)
+    if not n:
+        return None
+    for cmd, words in CMDS:
+        for w in words:
+            if n == norm(w):
+                return cmd
+    for kw in ("全功能", "仅控制", "普通模式", "仅聊天", "只聊天",
+               "重置agent次数"):
+        if n == norm(kw):
+            return "mode"
+    return None
+
+
 CLICK_WORDS = ("双击", "右键单击", "右键", "点一下", "点击", "点开",
                "戳一下", "戳", "click", "点")
 
@@ -330,17 +426,53 @@ def click_target(name):
     return t
 
 
-# ------------------------------------------------------------------ 运行模式（仅控制 / 全功能）
+# ------------------------------------------------------------------ 运行模式（三选一）
 # 配置存在 %LOCALAPPDATA%\ZhongYuToolBox\config.json
-#   {"mode": "control" | "full", "interval_min": 1..60}
-# 仅控制：只认白名单动作，其他话一律拒绝（不聊天、不答题）
-# 全功能：认不出来的话交给 DeepSeek 回答，可以聊天、问问题
+#   {"mode": "control" | "full" | "chat", "interval_min": 1..60}
+#
+#   control 仅控制   —— 只认白名单动作，其他话一律拒绝（不聊天、不跑 agent）
+#   full    全功能   —— 跳过关键词，整条交给 agent 编排（能组合多个动作，费钱）
+#   chat    普通模式 —— 原版行为：关键词命中就执行，认不出交给 DeepSeek 聊天
+#
+# ⚠️ 2026-10-30 之前只有 control / full 两种，那时 full 就是现在的 chat。
+#    迁移逻辑见 migrate_config()。
 
 def config_path():
     return os.path.join(_base_dir(), "config.json")
 
 
 DEFAULT_CONFIG = {"mode": "control", "interval_min": 1, "web_search": True}
+
+# 三种运行模式
+#   control 仅控制 —— 只执行关键词命中的动作，不聊天、不跑 agent
+#   full    全功能 —— 全部交给 agent 编排（关键词关掉），能聊天、能组合多个动作
+#   chat    普通模式 —— 原版行为：关键词动作 + 认不出就聊天
+MODES = ("control", "full", "chat")
+MODE_LABELS = {"control": "仅控制", "full": "全功能", "chat": "普通模式"}
+CONFIG_SCHEMA = 2          # 配置结构版本号，用于一次性迁移
+
+
+def migrate_config(d):
+    """把老配置迁移到当前结构。返回 (配置, 是否发生变化)。
+
+    2026-10-30 三模式改造：
+    老版本的 "full" 其实是「关键词动作 + 聊天兜底」，对应现在的「普通模式」；
+    新 "full" 变成了 agent。所以老的 full 一律迁到 chat ——
+    用户必须自己发一次「全功能」才会启用 agent，避免新功能突然上线咬人。
+    """
+    changed = False
+    try:
+        ver = int(d.get("config_schema") or 0)
+    except Exception:
+        ver = 0
+    if ver < CONFIG_SCHEMA:
+        if str(d.get("mode") or "").lower() == "full":
+            d["mode"] = "chat"
+        d["config_schema"] = CONFIG_SCHEMA
+        changed = True
+    if d.get("mode") not in MODES:
+        d["mode"] = "control"
+    return d, changed
 
 
 def load_config():
@@ -352,8 +484,12 @@ def load_config():
             d.update(got)
     except Exception:
         pass
-    if d.get("mode") not in ("control", "full"):
-        d["mode"] = "control"
+    d, changed = migrate_config(d)
+    if changed:
+        # 只落一次盘；之后 config_schema 已经是新值，不会再进这里
+        save_config(d)
+        log("配置已迁移到 schema %d，当前模式=%s"
+            % (CONFIG_SCHEMA, d.get("mode")))
     try:
         d["interval_min"] = max(1, min(60, int(d.get("interval_min") or 1)))
     except Exception:
@@ -511,14 +647,19 @@ CHAT_SYSTEM = """你是家里那台电脑上的小助手。用户在学校，用
 · 遇到危险请求（删文件、关机、改密码、付款），直接说做不到，让他回家自己弄"""
 
 
-THINK_LEVELS = ("off", "high", "max")
-THINK_LABELS = {"off": "关（最快最省）", "high": "标准", "max": "最高（最强也最慢）"}
+THINK_LEVELS = ("off", "low", "high", "max")
+THINK_LABELS = {"off": "关（最快最省）", "low": "低（快一些）",
+                "high": "标准", "max": "最高（最强最慢，且不限长度）"}
+
+MAX_TOKENS_CEIL = 8000          # 关/低/标准档的长度上限（设置里可调）
+UNLIMITED_MAX_TOKENS = 384000    # 最高档不设限：deepseek-flash 输出上限就是 384K
 
 
 def thinking_value():
-    """思考强度：off / high / max。
+    """思考强度：off / low / high / max（对齐 DeepSeek 的三档 reasoning_effort）。
 
-    DeepSeek 的 low、medium 都会被映射成 high，所以只保留三档，免得选项看着多其实重复。
+    DeepSeek 真正认的 effort 只有 low / high / max —— medium 会被映射成 high，
+    xhigh / ultra 会被映射成 max，所以这里按官方档位一一对应，不掺重复项。
     ⚠️ 思考模式下 temperature 不生效（不报错，但也不起作用）。
     """
     try:
@@ -529,26 +670,94 @@ def thinking_value():
 
 
 def _parse_think(name):
-    """从「思考 最高」这类标题里解析强度"""
+    """从「思考 最高」这类标题里解析强度。
+
+    平板可直接发：思考 关 / 思考 低 / 思考 标准 / 思考 最高
+    """
     s = str(name or "").lower()
     if any(k in s for k in ("关", "off", "不思考", "禁用")):
         return "off"
-    if any(k in s for k in ("max", "最高", "最强")):
+    if any(k in s for k in ("max", "最高", "最强", "顶")):
         return "max"
-    return "high"          # 只说「思考」「思考 高」都算标准档
+    if any(k in s for k in ("低", "low", "快", "省")):
+        return "low"
+    return "high"          # 只说「思考」「思考 高」「思考 标准」都算标准档
+
+
+def reasoning_effort_value(lvl):
+    """档位 → API 的 reasoning_effort 值"""
+    return lvl if lvl in ("low", "high", "max") else "high"
 
 
 def max_tokens_value():
-    """回答长度上限：读 config.max_tokens，默认 2000，夹在 200~8000"""
+    """回答长度上限：读 config.max_tokens，默认 2000，夹在 200~8000。
+
+    ⚠️ 只对「关 / 低 / 标准」三档生效。思考开到「最高」时不设限
+       （见 UNLIMITED_MAX_TOKENS），否则思维链会把预算吃光，正文照样写不完。
+    """
     try:
         v = int(load_config().get("max_tokens") or 2000)
     except Exception:
         v = 2000
-    return max(200, min(8000, v))
+    return max(200, min(MAX_TOKENS_CEIL, v))
+
+
+def max_tokens_for(lvl):
+    """按思考档位给出本次实际用的 max_tokens：最高档不设限。"""
+    return UNLIMITED_MAX_TOKENS if lvl == "max" else max_tokens_value()
+
+
+# ---------------------------------------------------------------- 单轮花费估算
+# 价格取 deepseek-flash 官网公开价（USD / 1M token）：
+#   输入·缓存命中 0.003 / 未命中 0.15 / 输出 0.6（均为低谷价）
+#   高峰时段（UTC 01:00~04:00、06:00~10:00，周一至周五 = 北京 09-12、14-18）翻倍
+# ⚠️ 这几个数只是用来"给个感觉"，不影响真实计费；官方调价后改这里即可。
+USD_CNY = 7.2
+PRICE_CACHE_HIT = 0.003
+PRICE_CACHE_MISS = 0.15
+PRICE_OUTPUT = 0.6
+PEAK_MULT = 2.0
+
+
+def _is_peak_now():
+    """当前是否 DeepSeek 高峰时段"""
+    u = datetime.datetime.utcnow()
+    return u.weekday() < 5 and (1 <= u.hour < 4 or 6 <= u.hour < 10)
+
+
+def cost_note(usage):
+    """把一轮的 token 用量 + 折算金额拼成一行（没有 usage 就返回空串）"""
+    if not isinstance(usage, dict) or not usage:
+        return ""
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or 0)
+    if not pt and not ct:
+        # 一次请求都没成功（或上游没给 usage）：别显示「0 token，不到 ¥0.0001」这种废话
+        return ""
+    hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+    miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+    if not miss and not hit:
+        miss = pt                       # 老返回值没给缓存明细，全按未命中算
+    peak = _is_peak_now()
+    usd = ((hit * PRICE_CACHE_HIT + miss * PRICE_CACHE_MISS + ct * PRICE_OUTPUT)
+           / 1000000.0) * (PEAK_MULT if peak else 1.0)
+    cny = usd * USD_CNY
+    money = ("不到 ¥0.0001" if cny < 0.0001 else "约 ¥%.4f" % cny)
+    return ("————————————\n"
+            "本轮：输入 {:,} + 输出 {:,} = {:,} token，花费 {}{}"
+            .format(pt, ct, pt + ct, money, "（高峰价）" if peak else ""))
+
+
+def with_cost(text, usage):
+    """给回复末尾补一行 token / 花费（没 usage 就原样返回）"""
+    note = cost_note(usage)
+    if not note or not (text or "").strip():
+        return text
+    return text.rstrip() + "\n\n" + note
 
 
 def chat_system():
-    """全功能模式实际用的聊天提示词。
+    """普通模式(chat)下 ds_chat 用的聊天提示词。
 
     优先读 config.json 的 prompt_full（用户在设置里自己写的），
     没写或写空就退回上面的内置默认。
@@ -714,6 +923,9 @@ def pick_image_urls(cli, file_id, limit=3):
     return [u for _, u in got[:limit]]
 
 
+VISION_MAX_TOKENS = 6000      # 看图关思考后的输出上限（原来写死 1500，完整解题常被砍断）
+
+
 def do_vision(urls, question, max_images=3):
     """看图回答（拍照解题）。
 
@@ -766,7 +978,13 @@ def do_vision(urls, question, max_images=3):
                              "后面 %d 张是同一张图放大后的局部切片（用来看小字细节）。"
                              "请结合两者来读，题目一道都别漏。" % sliced)
 
-    body = {"model": "deepseek-flash", "max_tokens": 1500,
+    body = {"model": "deepseek-flash",
+            "max_tokens": VISION_MAX_TOKENS,
+            # ⚠️ 必须**显式**关思考：DeepSeek 的思考模式默认就是开启的，
+            #    不传等于开着。看图不需要长推理，开着只会让思维链先把
+            #    max_tokens 预算烧光，正文一个字都轮不到（finish_reason=length），
+            #    表象就是「模型没给出内容」。2026-10-25 大图五连败就是它。
+            "thinking": {"type": "disabled"},
             "messages": [{"role": "user", "content": parts}]}
     try:
         req = urllib.request.Request(
@@ -775,13 +993,25 @@ def do_vision(urls, question, max_images=3):
                      "Authorization": "Bearer " + key})
         with op.open(req, timeout=120) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
-        msg = (data.get("choices") or [{}])[0].get("message") or {}
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        fin = choice.get("finish_reason")
         txt = (msg.get("content") or "").strip()
-        if not txt:
-            return "# 模型没给出内容\n\n这张图可能读不出来，换张清楚点的再试。"
         u = data.get("usage") or {}
-        log("看图回答：%d 张图，%s tokens" % (got, u.get("total_tokens")))
-        return txt
+        think = (msg.get("reasoning_content") or "").strip()
+        if not txt:
+            # 以前这个分支一行日志都不记，出事只能靠「没有成功行」反推，
+            # 现在把 finish_reason 和 token 用量都落下来，一眼看出是不是被截断。
+            log("看图正文为空：finish_reason=%r usage=%r 思考内容=%d字"
+                % (fin, u, len(think)))
+            if think:
+                return "# 看图（思考内容兜底）\n\n" + think
+            return ("# 模型没给出内容\n\n这张图可能读不出来，换张清楚点的再试。\n\n"
+                    "（诊断：finish_reason=%s，输出 %s token，可截图给作者看）"
+                    % (fin, u.get("completion_tokens")))
+        log("看图回答：%d 张图，%s tokens，finish=%s"
+            % (got, u.get("total_tokens"), fin))
+        return with_cost(txt, u)
     except Exception as e:
         log("看图失败 %r" % (e,))
         return "# 看图失败\n\n%s" % repr(e)
@@ -825,7 +1055,7 @@ def save_history(msgs):
 
 
 def ds_chat(question):
-    """全功能模式下的聊天/问答。返回回答文本；失败返回 None。
+    """普通模式下的聊天/问答。返回回答文本；失败返回 None。
 
     带**当天**的上下文记忆：历史存 chat_history.json，跨天自动清空。
     """
@@ -839,7 +1069,8 @@ def ds_chat(question):
             + [{"role": "user", "content": str(question)[:500]}])
     body = {
         "model": "deepseek-flash",
-        "max_tokens": max_tokens_value(),   # 可在设置界面或用「字数 3000」调整
+        # 思考开到「最高」时长度不设限（384K），其余档位按设置的「字数」走
+        "max_tokens": max_tokens_for(lvl),
         "messages": msgs,
     }
     if lvl == "off":
@@ -847,7 +1078,7 @@ def ds_chat(question):
         body["temperature"] = 0.7           # 只有非思考模式 temperature 才生效
     else:
         body["thinking"] = {"type": "enabled"}
-        body["reasoning_effort"] = "max" if lvl == "max" else "high"
+        body["reasoning_effort"] = reasoning_effort_value(lvl)
     try:
         req = urllib.request.Request(
             DS_API, data=json.dumps(body).encode("utf-8"),
@@ -860,12 +1091,14 @@ def ds_chat(question):
         msg = (data.get("choices") or [{}])[0].get("message") or {}
         txt = (msg.get("content") or "").strip() \
             or (msg.get("reasoning_content") or "").strip()
+        u = data.get("usage") or {}
         if txt:
-            # 只把「用户问题 + 最终回答」存进历史（思维链不回传，省 token）
+            # 只把「用户问题 + 最终回答」存进历史（思维链不回传，省 token）；
+            # 存的是纯正文，不含末尾那行花费说明
             hist.append({"role": "user", "content": str(question)[:500]})
             hist.append({"role": "assistant", "content": txt})
             save_history(hist)
-        return txt or None
+        return with_cost(txt, u) if txt else None
     except Exception as e:
         log("DeepSeek 聊天失败 %r" % (e,))
         return None
@@ -879,12 +1112,13 @@ def report_control_only(word):
         "",
         "这个模式下我只管操作电脑，不聊天、不回答问题。",
         "",
-        "能用的：",
-        "  状态 / 日报 / 额度 / DeepSeek余额 / 截图 / 点 xxx / 重启 / 帮助",
-        "  仪表盘（看当前设置）/ 频率 3（改检查间隔）",
+        "能用的指令（**这个模式不用加斜杠**，直接写就行）：",
+        "  /状态  /日报  /额度  /DeepSeek余额  /截图  /点 xxx  /重启  /帮助",
+        "  /仪表盘  /频率 3  /字数 3000  /思考 关|低|标准|最高",
         "",
-        "想聊天或问问题，直接发一条「全功能」就能切过去，",
-        "不用回电脑上操作。",
+        "想聊天或问问题，发一条模式指令切过去就行，不用回电脑：",
+        "· /普通模式 → 认得出关键词就执行，认不出就聊天，一句话一件事",
+        "· /全功能   → agent 模式，能一句话组合多个动作，费钱但灵活",
     ])
 
 
@@ -1244,7 +1478,7 @@ def mem_alert_text(usage, procs):
     if procs:
         lines += ["",
                   "最占的是 **%s**（%.0f MB）。" % (procs[0][2], procs[0][0]),
-                  "想让它重启一下的话，在「控制」里发「重启」就行。"]
+                  "想让它重启一下的话，在「控制」里发「/重启」就行。"]
     return "\n".join(lines)
 
 
@@ -1318,7 +1552,7 @@ def report_state():
     if d:
         lines.append("- 磁盘：%s" % d)
     bl, spent, left = quota_left(db)
-    lines.append("- 估算剩余：%s" % ("%.0f 分" % left if bl else "未校准（发「校准 5000」）"))
+    lines.append("- 估算剩余：%s" % ("%.0f 分" % left if bl else "未校准（发「/校准 5000」）"))
     lines.append("")
     lines.append("【其它】")
     if p["claw_app"]:
@@ -1329,7 +1563,7 @@ def report_state():
         claw = "未启动"
     lines.append("- EasyClaw：%s" % claw)
     lines.append("")
-    lines.append("（发「帮助」看能用哪些指令）")
+    lines.append("（发「/帮助」看能用哪些指令）")
     return "\n".join(lines)
 
 
@@ -1337,49 +1571,57 @@ def report_help():
     return "\n".join([
         "# 指令字典",
         "",
-        "怎么用：在「控制」文件夹里新建一条笔记，把下面某个词写在【标题】上，"
-        "等一会儿（多久看检查频率，发「仪表盘」能看到）。",
+        "⚠️ **全功能 / 普通模式**下指令必须以 / 开头（全角 ／ 也认），",
+        "   不带斜杠一律当聊天 —— 问「什么是状态机」不会再被当成指令。",
+        "   **仅控制模式不用加斜杠**，直接写「状态」就行（那模式不聊天，不会被劫持）。",
+        "",
+        "怎么用：在「控制」文件夹新建笔记，标题写成 `/状态` 这样，等一会儿。",
         "",
         "【看情况】",
-        "· 状态  → 电脑体检：CPU / 内存占用、WorkBuddy、接力链、加速器、磁盘、今天用了多少",
-        "           （内存超过 95% 它会**主动**发告警，还会列出最占内存的几个程序，不用你问）",
-        "· 日报  → 今天和昨天各花了多少积分",
-        "· 额度  → 估算还剩多少积分、还能撑几天（顺带显示 DeepSeek 账户余额）",
-        "· DeepSeek余额 → 只看 API 账户里还有多少钱（真钱，不是积分）",
-        "· 截图  → 拍一张电脑屏幕发给你（看看电脑到底在干嘛）",
+        "· /状态  → 电脑体检：CPU / 内存、WorkBuddy、接力链、磁盘、今天用了多少",
+        "           （内存超 95% 会主动告警，还会列出最占内存的几个程序）",
+        "· /日报  → 今天和昨天各花了多少积分",
+        "· /额度  → 还剩多少积分、还能撑几天（顺带显示 DeepSeek 余额）",
+        "· /DeepSeek余额 → 只看 API 账户还剩多少钱（真钱，不是积分）",
+        "· /截图  → 拍一张屏幕发给你",
         "",
         "【动一下】",
-        "· 点 / 双击 / 右键 xxx  → 截屏 → AI 两段定位（整图 + 局部放大）→ 点 → 发回画面",
-        "                目标随便描述：「点 任务栏的浏览器图标」「点 弹窗右上角的关闭」",
-        "                点偏了就在回传的图上再来一次：「点 保存按钮 右边一点」",
-        "· 重启  → **真的重启 WorkBuddy**：先把所有进程关掉，再重新启动",
-        "         （有任务正在跑时会自动推迟，怕打断它）",
-        "· 开启workbuddy  → 没在跑时把它启动起来（在跑就回「本来就在跑」）",
-        "· 关闭workbuddy  → 把它所有进程关掉（有任务在跑会推迟）",
+        "· /点 xxx  · /双击 xxx  · /右键 xxx → 截屏定位后点，点完自动截图",
+        "· /重启 → 真的重启 WorkBuddy（有任务在跑会推迟）",
+        "· /开启workbuddy  · /关闭workbuddy",
         "",
         "【看图 / 解题】",
-        "· 把照片插进**这个文件夹里**的笔记（发在别的文件夹它看不到）",
-        "  标题随便写「解这道题」就行，它会读出题面并给出步骤",
-        "· 也能读截图里的文字、看图表（一次最多 3 张）",
+        "· 把照片插进这个文件夹的笔记，标题写 /看图 或随便一句话都行",
+        "  （只要带了图片就会读题给步骤；一次最多 3 张）",
         "",
         "【联网搜索】",
-        "· 搜索 无锡今天天气  → 联网搜 5 条给你（每次约 5 厘钱）",
-        "· 搜 xxx / 查一下 xxx 也能用",
+        "· /搜索 无锡今天天气 → 联网搜 5 条给你（每次约 5 厘钱）",
+        "",
+        "【运行模式】",
+        "· /全功能 → agent：一句话能组合多个动作，费钱、慢几秒",
+        "            配额：" + agent_limits_text() + "；每天最多 %d 条" % AGENT_DAILY_LIMIT,
+        "· /普通模式 → 指令 + 聊天兜底，一句话办一件事",
+        "· /仅控制 → 只执行指令，不聊天、不跑 agent，最省钱",
         "",
         "【设置】",
-        "· 校准 5000  → 告诉电脑你当前的真实余额（写一次，以后每天自动扣减）",
-        "· 仪表盘  → 把设置页面的内容整理成图发给你（模式/频率/上次巡检）",
-        "· 全功能  → 切到全功能模式（能聊天、能答题）",
-        "· 仅控制  → 切回仅控制（只认指令，不聊天）",
-        "· 频率 3  → 检查频率改成每 3 分钟（范围 1~60）",
-        "· 字数 3000 → 回答长度上限（200~8000，越大越长也越费钱）",
-        "· 思考 高 / 思考 关 / 思考 max → 思考强度（越强越慢也越费钱）",
-        "· 开启搜索 / 关闭搜索 → 联网搜索的开关",
+        "· /校准 5000 → 告诉电脑你当前的真实余额",
+        "· /仪表盘 → 设置 + 系统保护状态 + 今日 agent 次数",
+        "· /频率 3 → 检查间隔（1~60 分钟）",
+        "· /字数 3000 → 回答长度上限（200~8000，只管关/低/标准三档）",
+        "· /开启搜索  · /关闭搜索",
+        "· /重置 agent 次数 → 今天用掉的全功能次数清零",
+        "",
+        "【思考强度】（四档）",
+        "· /思考 关  · /思考 低  · /思考 标准  · /思考 最高",
+        "  最高档不限回答长度；看图一律不思考，不受这里影响",
         "",
         "【说明】",
+        "· 回复末尾会附「本轮 … token，花费约 ¥…」（按官网价估算）",
+        "· 点击只能点你**原话里写过**的东西；点完自动截图给你复核",
+        "· 删除 / 卸载 / 格式化 / 提交 / 付款 / 转账 / 注销 这类目标一律不点",
         "· 截图 / 点 只在 07:00~23:00 执行",
         "· 只认白名单动作，不会执行你写的任何命令",
-        "· 随时发「帮助」再看这份表",
+        "· 随时发「/帮助」再看这份表",
     ])
 
 
@@ -1387,9 +1629,19 @@ def report_dashboard():
     """仪表盘：把设置界面的关键内容整理成一张图发到平板"""
     cfg = load_config()
     st = load_state()
+    lvl = thinking_value()
     n = max(1, int(cfg.get("interval_min") or 1))
-    mode = ("全功能 —— 能聊天、能答题" if cfg.get("mode") == "full"
-            else "仅控制 —— 只认指令，不聊天")
+    md = str(cfg.get("mode") or "control").lower()
+    mode = {
+        "full": "全功能 —— agent 编排，能组合多个动作（费钱）",
+        "chat": "普通模式 —— 关键词执行 + 聊天兜底",
+        "control": "仅控制 —— 只执行指令，不聊天、不跑 agent",
+    }.get(md, "仅控制 —— 只执行指令")
+    try:
+        import guard as _g
+        g_on, g_every = _g.guard_on(), _g.GUARD_EVERY_MIN
+    except Exception:
+        g_on, g_every = False, 30
     lc = (st.get("lastCheck") or "").strip()
     line_lc, line_next = "还没跑过", "—"
     if lc:
@@ -1407,14 +1659,40 @@ def report_dashboard():
         "",
         "【模式】" + mode,
         "【检查频率】每 %d 分钟" % n,
-        "【回答上限】%d token" % max_tokens_value(),
-        "【思考强度】" + THINK_LABELS.get(thinking_value(), "关"),
+        "【回答上限】" + ("不限（最高档）" if lvl == "max"
+                         else "%d token" % max_tokens_value()),
+        "【思考强度】" + THINK_LABELS.get(lvl, "关"),
+        "【识图思考】固定关闭（看图不烧思考的 token）",
+        "【全功能】今日已用 %d/%d 次" % (agent_daily_used(st), AGENT_DAILY_LIMIT),
+        "【系统保护】" + ("开（每 %d 分钟检查，挂了自动拉起）" % g_every
+                         if g_on else "关（不会自动拉起）"),
         "【上次巡检】" + line_lc,
         "【下次预计】" + line_next,
         "",
         "————————————",
-        "改模式：发「全功能」或「仅控制」",
-        "改频率：发「频率 3」（1~60 分钟）",
+        "改模式：发「/全功能」「/普通模式」「/仅控制」",
+        "改频率：发「/频率 3」（1~60 分钟）",
+        "改思考：发「/思考 关」或 /思考 低 / 标准 / 最高",
+    ])
+
+
+def report_need_slash(word):
+    """忘了加斜杠时的提醒（不执行任何动作）"""
+    return "\n".join([
+        "# 指令要先加斜杠",
+        "",
+        "你写的是：「%s」" % word,
+        "",
+        "**全功能 / 普通模式**下，只有以 `/` 开头的标题才算指令，",
+        "这样你平时问「什么是状态机」就不会被当成指令执行了。",
+        "",
+        "想查电脑状态，标题就这样写：",
+        "",
+        "    /状态",
+        "",
+        "其它指令同理。发「/帮助」可以看完整清单。",
+        "",
+        "（这条只是提醒，什么都没有执行）",
     ])
 
 
@@ -1424,11 +1702,15 @@ def report_unknown(word):
         "",
         "你写的是：「%s」" % word,
         "",
-        "现在能认的指令：",
-        "  状态   日报   额度   截图   重启   帮助",
-        "  校准 5000（把数字换成你的余额）",
+        "现在能认的指令（**都要以 / 开头**）：",
+        "  /状态   /日报   /额度   /截图   /重启   /帮助   /仪表盘",
+        "  /校准 5000（把数字换成你的余额）",
+        "  /频率 3（改检查间隔）  /字数 3000（改回答长度上限）",
+        "  /思考 关|低|标准|最高（现在是：%s）"
+        % THINK_LABELS.get(thinking_value(), "关").split("（")[0],
         "",
-        "写「帮助」可以看完整字典。",
+        "想让它自己组合多个动作（「先看状态再截个图」这种），发「/全功能」。",
+        "写「/帮助」可以看完整字典。",
     ])
 
 
@@ -1611,7 +1893,7 @@ def do_calibrate(word):
                       "- 基准日期：%s" % d["day"],
                       "- 当时余额：%.0f 分" % n,
                       "",
-                      "以后每天会自动扣减实际消耗，发「额度」就能看剩余。"])
+                      "以后每天会自动扣减实际消耗，发「/额度」就能看剩余。"])
 
 
 def _workbuddy_procs():
@@ -1696,10 +1978,10 @@ def do_restart():
             "结束了 %d 个进程：" % len(killed),
             "  · " + "\n  · ".join(killed),
             "",
-            "已经重新启动，等 1~2 分钟发「状态」确认一下。",
+            "已经重新启动，等 1~2 分钟发「/状态」确认一下。",
         ])
     return "\n".join(["# 已经拉起来了", "",
-                      "WorkBuddy 本来没在跑，已启动。等 1~2 分钟发「状态」确认。"])
+                      "WorkBuddy 本来没在跑，已启动。等 1~2 分钟发「/状态」确认。"])
 
 
 def wb_kill_all():
@@ -1740,13 +2022,13 @@ def do_wb_start():
             "# WorkBuddy 本来就在跑",
             "",
             "当前有 %d 个进程，不用开。" % len(procs),
-            "想让它重来一遍，发「重启」。",
+            "想让它重来一遍，发「/重启」。",
         ])
     ok, why = wb_start()
     if not ok:
         return "\n".join(["# 启动失败", "", why])
     return "\n".join(["# 已开启 WorkBuddy", "",
-                      "等 1~2 分钟发「状态」确认一下。"])
+                      "等 1~2 分钟发「/状态」确认一下。"])
 
 
 def do_wb_stop():
@@ -1784,7 +2066,7 @@ def do_wb_stop():
         "结束了 %d 个进程：" % len(killed),
         "  · " + "\n  · ".join(killed),
         "",
-        "想再开回来，发「开启workbuddy」。",
+        "想再开回来，发「/开启workbuddy」。",
     ])
 
 
@@ -1811,6 +2093,47 @@ def do_screenshot(cli, note):
     if not (os.path.exists(png) and os.path.exists(jpg)):
         return None, "图生成了但文件不见了（可能被并发实例回收）：%s" % png
     return (png, jpg), None
+
+
+def stitch_shots(paths, max_width=1200):
+    """把多张截图纵向拼成一张（宽度统一），返回文件路径。
+
+    为什么需要：云笔记的页内图一次只能挂一张（`upload_note_page` 的
+    `body_image_path` 是单值）。agent 一轮点了几次就有几张图，
+    不拼的话用户只能看到最后一张。
+
+    失败时**退回第一张**——宁可少看几张，也不能因为拼接出错把复核凭据弄丢。
+    """
+    ps = [p for p in (paths or []) if p and os.path.exists(p)]
+    if not ps:
+        return None
+    if len(ps) == 1:
+        return ps[0]
+    try:
+        from PIL import Image
+        imgs = [Image.open(p).convert("RGB") for p in ps]
+        w = min(max_width, max(im.width for im in imgs))
+        scaled = []
+        for im in imgs:
+            if im.width != w:
+                h = max(1, int(round(im.height * w / float(im.width))))
+                im = im.resize((w, h), Image.LANCZOS)
+            scaled.append(im)
+        total_h = sum(im.height for im in scaled)
+        canvas = Image.new("RGB", (w, total_h), (255, 255, 255))
+        y = 0
+        for im in scaled:
+            canvas.paste(im, (0, y))
+            y += im.height
+        out = os.path.join(
+            _base_dir(),
+            "ctrl_shot_%s.jpg" % datetime.datetime.now().strftime("%m%d-%H%M%S"))
+        canvas.save(out, "JPEG", quality=82)
+        log("截图拼接：%d 张 → %s（%dx%d）" % (len(scaled), out, w, total_h))
+        return out
+    except Exception as e:
+        log("截图拼接失败 %r，退回第一张" % (e,))
+        return ps[0]
 
 
 def _decode_out(raw):
@@ -1879,20 +2202,24 @@ def report_nolink():
         "",
         "不过你也不需要它：",
         "· 看门狗**每小时会自动检查一次**，链子断了它自己补",
-        "· 想知道现在有没有断 → 发「**状态**」，看「接力链最后活动」那一行",
+        "· 想知道现在有没有断 → 发「/状态」，看「接力链最后活动」那一行",
         "· 如果链子真断了，状态报告会直接告诉你",
         "",
-        "想知道有哪些指令，发「帮助」。",
+        "想知道有哪些指令，发「/帮助」。",
     ])
 
 
 # ------------------------------------------------------------------ 发回云端
 
-def send_back(title, name, text, dry=False, parent=None):
+def send_back(title, name, text, dry=False, parent=None, image=None):
     """调 send_text.py 渲染并上传（默认发到「控制」文件夹）。
 
     ⚠️ 一张页面图最多放得下 50 行出头，超了会被截断（帮助文档 72 行就踩过）。
        所以超过 52 行自动拆成多页发，标题带 (1/2) 这种页码。
+
+    image：可选的**真实截图**路径（点击后复核用）。会作为页内图附在
+           **最后一页**——正文读完了正好看到"点完的样子"。
+           多张截图请调用方先拼成一张再传进来。
     """
     lines = str(text).split("\n")
     if len(lines) > 52 and not dry:
@@ -1901,7 +2228,8 @@ def send_back(title, name, text, dry=False, parent=None):
         for idx, pg in enumerate(pages, 1):
             ok = send_back("%s（%d/%d）" % (title, idx, len(pages)),
                            "%s-P%d" % (name, idx),
-                           "\n".join(pg), dry=dry, parent=parent) and ok
+                           "\n".join(pg), dry=dry, parent=parent,
+                           image=(image if idx == len(pages) else None)) and ok
             time.sleep(1)
         return ok
     tmp = os.path.join(_base_dir(), "ctrl_reply.txt")
@@ -1909,13 +2237,27 @@ def send_back(title, name, text, dry=False, parent=None):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
 
+    extra = []
+    if image and os.path.exists(image):
+        extra = ["--body-image", image]
+    elif image:
+        log("send_back：附图不存在，已忽略 %r" % (image,))
+
     cmd = _child_cmd("send_text", ["--text-file", tmp, "--title", title,
                                    "--name", name,
-                                   "--parent", parent or CONTROL_DIR])
+                                   "--parent", parent or CONTROL_DIR] + extra)
     if dry:
-        print("[dry-run] 将要上传：title=%s  name=%s" % (title, name))
+        print("[dry-run] 将要上传：title=%s  name=%s  附图=%s"
+              % (title, name, image or "无"))
         print(text)
         return True
+
+    # 先确认子进程要用的文件都在，缺了就直接说清楚（别只抛个异常类型）
+    miss = _missing_child_file(cmd)
+    if miss:
+        log("上传失败：子进程要用的文件不存在 %r｜完整命令 %r｜工作目录 %r"
+            % (miss, cmd, HERE))
+        return False
 
     env = dict(os.environ)
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
@@ -1934,7 +2276,7 @@ def send_back(title, name, text, dry=False, parent=None):
             print(err[-800:])
         return ok
     except Exception as e:
-        log("上传异常 %r" % (e,))
+        log("上传异常 %r｜命令 %r｜工作目录 %r" % (e, cmd, HERE))
         return False
 
 
@@ -1965,35 +2307,136 @@ def save_state(st):
         log("保存状态失败 %r" % (e,))
 
 
+def agent_daily_used(st):
+    """读今天已经用掉的全功能次数（跨天视为 0，不落盘）"""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    d = st.get("agentDaily")
+    if not isinstance(d, dict) or d.get("date") != today:
+        return 0
+    try:
+        return max(0, int(d.get("count") or 0))
+    except Exception:
+        return 0
+
+
+def agent_daily_inc(st):
+    """给今天的全功能次数 +1。返回 (是否允许, 用后次数, 上限)。
+
+    超限时**不再增加计数**，直接返回 False 让调用方降级成普通模式。
+    """
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    used = agent_daily_used(st)
+    if used >= AGENT_DAILY_LIMIT:
+        st["agentDaily"] = {"date": today, "count": used}
+        return False, used, AGENT_DAILY_LIMIT
+    st["agentDaily"] = {"date": today, "count": used + 1}
+    return True, used + 1, AGENT_DAILY_LIMIT
+
+
+def agent_daily_reset(st):
+    """当天次数清零（用户发「/重置 agent 次数」时用）"""
+    st["agentDaily"] = {"date": datetime.date.today().strftime("%Y-%m-%d"),
+                        "count": 0}
+
+
+def agent_limits_text():
+    """把 agent 的配额说成人话。
+
+    ⚠️ 数字**必须**从 agent_loop 里取。写死在文案里的话，
+       以后改了配额就会出现"帮助里说 3 次、代码实际 5 次"的割裂。
+    """
+    try:
+        import agent_loop as al
+        return ("工具 %d 次/条、搜索 %d 次、截图 %d 张"
+                % (al.MAX_TOOL_CALLS, al.MAX_SEARCH, al.MAX_SHOTS))
+    except Exception:
+        return "工具 3 次/条、搜索 2 次、截图 3 张"
+
+
+# ------------------------------------------------------------------ 回执重试队列
+# 2026-10-25 事故的教训：
+#   那天下午 exe 被替换，正在跑的进程还在用旧路径，子进程一个都起不来，
+#   回执全部发送失败。而当时的逻辑是「发送成功才记账」——
+#   于是同一条指令被下一轮当成新指令，**连续执行了 75 分钟**。
+#   你人在学校，平板上一片空白，完全不知道发生了什么。
+#
+# 现在的规矩：
+#   1. 指令一经执行，**立刻记账**，不管回执发没发出去（绝不重复执行）
+#   2. 回执失败就进这个队列，后面几轮慢慢补发
+#   3. 积压超过上限或太旧就丢弃，不会无限涨
+
+REPLY_QUEUE_MAX = 20
+REPLY_QUEUE_TTL = 6 * 3600      # 6 小时后不再补发（已经没意义了）
+
+
+def queue_reply(st, title, name, text):
+    """把发失败的回执存起来，等上传恢复了再补发"""
+    q = st.get("replyQueue")
+    if not isinstance(q, list):
+        q = []
+    q.append({"ts": time.time(), "title": str(title or "回执"),
+              "name": str(name or "回执"), "text": str(text or "")})
+    st["replyQueue"] = q[-REPLY_QUEUE_MAX:]
+    log("回执发送失败，已存进重试队列（当前 %d 条）" % len(st["replyQueue"]))
+
+
+def flush_reply_queue(st, dry=False, limit=2):
+    """把积压的回执补发出去。返回成功补发条数。
+
+    每轮最多补发 limit 条：一是别拖慢巡检，二是上传还没恢复时
+    一条条试也是白试，慢慢挪就行。
+    """
+    q = st.get("replyQueue")
+    if not isinstance(q, list) or not q:
+        return 0
+    now = time.time()
+    keep, sent = [], 0
+    for item in q:
+        try:
+            old = now - float(item.get("ts") or 0)
+        except Exception:
+            old = 0
+        if old > REPLY_QUEUE_TTL:
+            log("回执积压超过 6 小时，丢弃：%s" % item.get("name"))
+            continue
+        if sent >= limit:
+            keep.append(item)
+            continue
+        if send_back(item.get("title") or "回执", item.get("name") or "回执",
+                     item.get("text") or "", dry=dry):
+            sent += 1
+            time.sleep(1)
+        else:
+            keep.append(item)
+    st["replyQueue"] = keep
+    if sent:
+        log("补发积压回执 %d 条（还剩 %d 条）" % (sent, len(keep)))
+    return sent
+
+
+def mark_handled(st, done, fid, upd, ok, title=None, name=None, text=None,
+                 dry=False):
+    """一条指令处理完的收尾：记账，回执失败就排队。
+
+    ⚠️ **回执失败也必须记账**。指令可能已经改了配置、点过按钮了，
+       不记账就会在下一轮被当成新指令再执行一遍（2026-10-25 踩过）。
+    """
+    if dry:
+        return ok
+    done[fid] = upd
+    if not ok and text is not None:
+        queue_reply(st, title, name, text)
+    return ok
+
+
 # ------------------------------------------------------------------ 主流程
 
-# ------------------------------------------------------------------ 保底程序体检
-# 用户说的「保底程序」= 桌面那套开关：
-#   本地AI 开关.bat / 启动本地AI.bat / 关闭本地AI.bat
-# 2026-10-17：本地模型（llama-server + gguf）已按要求删除，这里只检查开关文件还在不在。
-# 每轮巡检顺带跑一次，纯本地、零成本；只在**有问题时**写日志，正常不刷屏。
-
-SWITCH_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "本地AI")
-SWITCH_FILES = ("本地AI 开关.bat", "启动本地AI.bat", "关闭本地AI.bat")
-GUARD_LOG = os.path.join(_base_dir(), "zy_local_ai_guard.log")
-
-
-def guard_switch():
-    """体检保底程序是否完好；有问题返回 False 并写日志"""
-    missing = []
-    for name in SWITCH_FILES:
-        if not os.path.exists(os.path.join(SWITCH_DIR, name)):
-            missing.append("开关文件 " + name)
-    if not missing:
-        return True
-    try:
-        os.makedirs(_base_dir(), exist_ok=True)
-        with open(GUARD_LOG, "a", encoding="utf-8") as f:
-            f.write("[%s] BAD 保底程序缺失：%s\n" % (
-                datetime.datetime.now().strftime("%m-%d %H:%M:%S"), "、".join(missing)))
-    except Exception:
-        pass
-    return False
+# ------------------------------------------------------------------ 保底程序体检（已移除）
+# 2026-10-31 移除。原因：本地 AI 模型（llama-server + gguf）已于 10-17 按要求删除，
+# 桌面那套「本地AI 开关.bat」也早就不存在。这段检查每轮巡检都跑，
+# 一直在往 zy_local_ai_guard.log 里刷「BAD 保底程序缺失」（累计上万行），
+# 属于纯噪音，对功能没有任何帮助。
+# 对应桌面《备忘报错日志.txt》第 1 条。
 
 
 def list_control_items(cli):
@@ -2140,7 +2583,6 @@ def run_once(args, force=False, dry=False):
 
 
 def _run_once_inner(args, force=False, dry=False):
-    guard_switch()          # 顺带体检「保底程序」（桌面开关 + 依赖），缺失才写日志
     import zy_client
     try:
         cli = zy_client.build_client()
@@ -2171,6 +2613,12 @@ def _run_once_inner(args, force=False, dry=False):
     done = st.setdefault("processed", {})
     st["lastCheck"] = datetime.datetime.now().isoformat(timespec="seconds")
     mem_alert_if_needed(st, dry=args.dry)  # 内存 ≥95% 主动发一条告警（30 分钟冷却，防刷屏）
+
+    # 先把之前没发出去的回执补发掉（上传恢复后会一轮轮慢慢补齐）
+    try:
+        flush_reply_queue(st, dry=args.dry, limit=2)
+    except Exception as e:
+        log("补发积压回执异常 %r" % (e,))
 
     todo = []
     for n in items:
@@ -2208,20 +2656,73 @@ def _run_once_inner(args, force=False, dry=False):
                 done[fid] = upd
             continue
 
-        cmd = match_cmd(name)
+        # ---- 全功能模式：跳过关键词匹配，整条交给 agent 编排
+        #      正常情况处理完就 continue；只有"今天次数用完"才会降级往下走
+        eff_mode = mode
+        degraded = ""           # 非空 = 今天次数用完、本次按普通模式处理
+        if mode == "full":
+            allow, used, limit = agent_daily_inc(st)
+            if allow:
+                print("  🤖 全功能处理：%s（今日第 %d/%d 次）" % (name, used, limit))
+                log("全功能处理 %r（今日 %d/%d）" % (name, used, limit))
+                save_state(st)          # 先把次数落盘，免得 agent 跑一半崩了白算
+                if args.dry:
+                    # ⚠️ dry 试跑**不记账**，否则这条指令会被吃掉、真跑时跳过
+                    print("[dry] 会用 agent 处理，不真跑")
+                    continue
+                imgs = pick_image_urls(cli, fid)
+                try:
+                    import agent_loop
+                    text, shots = agent_loop.run_agent(name, imgs, cli=cli)
+                except Exception as e:
+                    log("agent 崩溃 %r" % (e,))
+                    text, shots = ("# 全功能出错了\n\n%r\n\n"
+                                   "（这是代码问题，把这条截图发给作者看）" % (e,)), []
+                image = stitch_shots(shots) if shots else None
+                ok = send_back("全功能", "%s全功能-%s" % (REPLY_PREFIX, now),
+                               text, dry=args.dry, image=image)
+                mark_handled(st, done, fid, upd, ok, "全功能",
+                             "%s全功能-%s" % (REPLY_PREFIX, now),
+                             text, args.dry)
+                if ok and not args.dry:
+                    # 上传成功才回收临时图（失败就留着，补发回执时可能还要用）
+                    try:
+                        import zy_upload
+                        zy_upload.recycle_paths(sorted(set(
+                            [p for p in (shots or []) if p]
+                            + ([image] if image and image != "dry" else []))))
+                    except Exception as e:
+                        log("回收临时截图失败 %r" % (e,))
+                continue
+
+            # 今日配额用完 → 不瘫痪：安静降级成普通模式，最后在回复顶部说明一句。
+            # （不单独再发一条"次数用完"，否则一次指令会收到两条回复）
+            save_state(st)
+            print("  ⏳ 全功能今日次数已用完（%d/%d），降级为普通模式" % (used, limit))
+            log("全功能今日次数用完（%d/%d），%r 降级为普通模式" % (used, limit, name))
+            eff_mode = "chat"
+            degraded = ("今天全功能次数已用完（%d/%d），这条按普通模式处理"
+                        % (used, limit))
+
+        # 仅控制模式不需要斜杠（这个模式不聊天，没有"被劫持"的问题）
+        need_slash = (eff_mode != "control")
+        cmd = match_cmd(name, require_slash=need_slash)
         src = "关键词"
         dtarget = None
         img_urls = []
+        is_cmd = is_command(name)          # 带斜杠 = 用户明确在发指令
+
         if cmd is None:
-            # 认不出关键词时，先看这条笔记有没有图 —— 发了图就是想让我看图（拍照解题）
+            # 先看这条笔记有没有图 —— 发了图就是想让我看图（拍照解题）
             img_urls = pick_image_urls(cli, fid)
             if img_urls:
                 cmd, src = "vision", "图片"
-            else:
-                # 纯文字才让 DeepSeek 判意图（省一次调用）
+            elif is_cmd:
+                # 带了斜杠但关键词没命中：**这时才**让模型判意图。
+                # 不带斜杠的一律不判 —— 否则问句话又会被认成指令（劫持的来源）。
                 cmd, dtarget = ds_intent(name)
-                src = "DeepSeek" if cmd else "都不认识"
-        print("处理指令：%s -> %s（%s）" % (name, cmd or "不认识", src))
+                src = "DeepSeek" if cmd else "加了斜杠但没看懂"
+        print("处理指令：%s -> %s（%s）" % (name, cmd or "聊天/无动作", src))
 
         # ---- 截图是"发图"不是"发字"，单独走一条路
         if cmd == "shot":
@@ -2265,26 +2766,29 @@ def _run_once_inner(args, force=False, dry=False):
                     print("截屏上传失败：%r" % (e,))
                     # ⚠️ 2026-10-17 修：这里原来只写日志、不回消息，
                     # 用户在平板上看到的就是「发了没反应」，完全不知道卡在哪。
-                    if send_back("截图没发出去", "%s截图失败-%s" % (REPLY_PREFIX, now),
-                                 "\n".join([
-                                     "# 截图没发出去",
-                                     "",
-                                     "屏幕抓到了，但往云笔记上传时出错：",
-                                     "",
-                                     "```",
-                                     str(e)[:300],
-                                     "```",
-                                     "",
-                                     "过一会儿再发一次「截图」试试。",
-                                     "（电脑本地日志里也记了一份）"]),
-                                 dry=dry) and not dry:
-                        done[fid] = upd
+                    _t = "\n".join([
+                        "# 截图没发出去",
+                        "",
+                        "屏幕抓到了，但往云笔记上传时出错：",
+                        "",
+                        "```",
+                        str(e)[:300],
+                        "```",
+                        "",
+                        "过一会儿再发一次「截图」试试。",
+                        "（电脑本地日志里也记了一份）"])
+                    _n = "%s截图失败-%s" % (REPLY_PREFIX, now)
+                    mark_handled(st, done, fid, upd,
+                                 send_back("截图没发出去", _n, _t, dry=dry),
+                                 "截图没发出去", _n, _t, dry)
             else:
                 # 抓屏失败也回一条说明，免得他不知道发生了什么
                 log("截屏失败（抓屏阶段）：%s" % (err or "未知原因"))
-                if send_back("截图失败", "%s截图失败-%s" % (REPLY_PREFIX, now),
-                             "\n".join(["# 截图没成功", "", err or "未知原因"])):
-                    done[fid] = upd
+                _t = "\n".join(["# 截图没成功", "", err or "未知原因"])
+                _n = "%s截图失败-%s" % (REPLY_PREFIX, now)
+                mark_handled(st, done, fid, upd,
+                             send_back("截图失败", _n, _t, dry=dry),
+                             "截图失败", _n, _t, dry)
             continue
 
         # ---- 点击：AI 看屏幕找目标 → 单击 → 回传一张新截图
@@ -2398,17 +2902,17 @@ def _run_once_inner(args, force=False, dry=False):
         elif cmd == "search_on":
             cfg["web_search"] = True
             save_config(cfg)
-            text, title = ("# 联网搜索已开启\n\n发「搜索 无锡天气」试试。", "搜索已开启")
+            text, title = ("# 联网搜索已开启\n\n发「/搜索 无锡天气」试试。", "搜索已开启")
             log("联网搜索：已开启")
         elif cmd == "search_off":
             cfg["web_search"] = False
             save_config(cfg)
-            text, title = ("# 联网搜索已关闭\n\n再发「搜索 xxx」会提示已关闭。\n\n"
-                           "想开回来，发「开启搜索」。", "搜索已关闭")
+            text, title = ("# 联网搜索已关闭\n\n再发「/搜索 xxx」会提示已关闭。\n\n"
+                           "想开回来，发「/开启搜索」。", "搜索已关闭")
             log("联网搜索：已关闭")
         elif cmd == "search":
             if not cfg.get("web_search", True):
-                text, title = ("# 联网搜索现在是关着的\n\n发「开启搜索」就能打开。",
+                text, title = ("# 联网搜索现在是关着的\n\n发「/开启搜索」就能打开。",
                                "搜索已关闭")
             else:
                 q = pick_query(name)
@@ -2421,39 +2925,94 @@ def _run_once_inner(args, force=False, dry=False):
                                        "（可能是网络问题，或没配 DeepSeek key）" % err,
                                        "搜索失败")
                     else:
-                        text, title = format_search(q, items), "搜索结果"
+                        text = (format_search(q, items) +
+                                "\n\n————————————\n"
+                                "本次联网搜索：约 ¥0.0054（$0.75/千次，按次计费）")
+                        title = "搜索结果"
                         log("联网搜索：%s → %d 条" % (q, len(items)))
         elif cmd == "mode_full":
             cfg["mode"] = "full"
             save_config(cfg)
-            text, title = ("# 已切到全功能\n\n现在能聊天、能答题了。\n\n"
-                           "想改回去，发「仅控制」。", "已切到全功能")
-            log("模式切换：full")
+            used_now = agent_daily_used(st)
+            text, title = ("\n".join([
+                "# 已切到全功能（agent 模式）",
+                "",
+                "现在你说一句话，我会自己判断该调哪几个工具、按什么顺序办，",
+                "能组合多个动作了 —— 比如「看下状态再截个图，顺便查下余额」。",
+                "",
+                "**这个模式每条指令都会调用 DeepSeek**，比另外两个模式费钱，",
+                "每条也慢几秒。配额：" + agent_limits_text() + "。",
+                "今日已用 %d/%d 次，明天 0 点自动恢复。" % (used_now, AGENT_DAILY_LIMIT),
+                "",
+                "· 想省钱：发「/普通模式」（按关键词执行，不烧 agent）",
+                "· 只操作不聊天：发「/仅控制」",
+            ]), "已切到全功能")
+            log("模式切换：full（全功能·agent）")
         elif cmd == "mode_control":
             cfg["mode"] = "control"
             save_config(cfg)
-            text, title = ("# 已切到仅控制\n\n现在只认指令，不聊天、不答题。\n\n"
-                           "想切回来，发「全功能」。", "已切到仅控制")
+            text, title = ("\n".join([
+                "# 已切到仅控制",
+                "",
+                "现在只认指令、只操作电脑，不聊天、不答题，也不跑 agent。",
+                "这是三个模式里最省钱、最确定的一个。",
+                "",
+                "· 想聊天、也想让它组合动作：发「/全功能」",
+                "· 想聊天但不想花 agent 的钱：发「/普通模式」",
+            ]), "已切到仅控制")
             log("模式切换：control")
+        elif cmd == "mode_chat":
+            cfg["mode"] = "chat"
+            save_config(cfg)
+            text, title = ("\n".join([
+                "# 已切到普通模式",
+                "",
+                "这是改造前的原版行为：认得出关键词就直接执行，",
+                "认不出就当聊天回答。**一句话只能办一件事**，不会自己组合动作。",
+                "",
+                "好处是不烧 agent 的钱、响应快；坏处是「看状态再截图」这种得发两条。",
+                "",
+                "· 想让它一次办一串：发「/全功能」",
+                "· 只操作不聊天：发「/仅控制」",
+            ]), "已切到普通模式")
+            log("模式切换：chat（普通模式）")
+        elif cmd == "agent_reset":
+            agent_daily_reset(st)
+            save_state(st)
+            text, title = ("\n".join([
+                "# 全功能次数已重置",
+                "",
+                "今天的 agent 次数归零了（0/%d）。" % AGENT_DAILY_LIMIT,
+                "",
+                "现在发「/全功能」就能重新用它。",
+            ]), "次数已重置")
+            log("全功能次数已手动重置")
         elif cmd == "set_think":
             lvl = _parse_think(name)
             cfg["thinking"] = lvl
             save_config(cfg)
-            extra = ("关闭后最快最省，但复杂题、长推理容易出错。"
-                     if lvl == "off" else
-                     "开启后解题、推理会更准，但更慢也更费钱"
-                     "（思考过程也按输出计费）。")
-            text, title = ("# 思考强度：%s\n\n%s\n\n下一轮生效。"
+            extra = {
+                "off": "关闭后最快最省，但复杂题、长推理容易出错。",
+                "low": "比「关」准一点，速度还快，日常刷题够用。",
+                "high": "解题、推理更准，但更慢也更费钱（思考过程也按输出计费）。",
+                "max": "最强档：推理最充分，而且**回答长度不再受 8000 限制**；"
+                       "最慢也最贵，卡住的难题再用它。",
+            }.get(lvl, "")
+            text, title = ("# 思考强度：%s\n\n%s\n\n下一轮生效。\n\n"
+                           "四个档位随时能换，直接发：\n"
+                           "  思考 关 / 思考 低 / 思考 标准 / 思考 最高"
                            % (THINK_LABELS[lvl], extra),
-                           "思考%s" % ("关闭" if lvl == "off" else lvl))
+                           "思考%s" % THINK_LABELS[lvl].split("（")[0])
             log("思考强度改为 %s" % lvl)
         elif cmd == "set_maxtok":
-            v = max(200, min(8000, int(pick_number(name) or 2000)))
+            v = max(200, min(MAX_TOKENS_CEIL, int(pick_number(name) or 2000)))
             cfg["max_tokens"] = v
             save_config(cfg)
             text, title = ("# 回答长度上限：%d\n\n"
                            "范围 200~8000。调大回答更完整、也更费钱；调小更省，"
-                           "但知识点/解题这类可能被砍断。" % v,
+                           "但知识点/解题这类可能被砍断。\n\n"
+                           "注意：这个上限只管「关 / 低 / 标准」三档；"
+                           "思考开到「最高」时不设限（384K）。" % v,
                            "长度上限%d" % v)
             log("回答长度上限改为 %d" % v)
         elif cmd == "set_freq":
@@ -2468,8 +3027,18 @@ def _run_once_inner(args, force=False, dry=False):
         elif cmd == "nolink":
             text, title = report_nolink(), "这个不用你操心"
         else:
-            # 认不出来的话：全功能模式交给我聊天，仅控制模式直接拒绝
-            if mode == "full":
+            # 认不出来的话，分三种情况：
+            #   1) 像指令但忘了加斜杠 → 提醒一句，**不执行**
+            #   2) 全功能 / 普通模式 → 交给我聊天
+            #   3) 仅控制 → 直接拒绝
+            # 只有"需要斜杠的模式"才提醒加斜杠；仅控制模式不用
+            hint = None
+            if need_slash and not is_cmd:
+                hint = looks_like_command(name)
+            if hint:
+                text, title = report_need_slash(name), "要加斜杠"
+                log("提醒加斜杠：%s" % name[:30])
+            elif eff_mode in ("full", "chat"):
                 ans = ds_chat(name)
                 if ans:
                     text, title = ans, "回答"
@@ -2479,10 +3048,16 @@ def _run_once_inner(args, force=False, dry=False):
             else:
                 text, title = report_control_only(name), "只做控制"
 
+        if degraded:
+            text = ("（%s；发「/重置 agent 次数」可提前解封）\n\n" % degraded) + text
+
         ok = send_back(title, "%s%s-%s" % (REPLY_PREFIX, title, now), text, dry=dry)
-        # ⚠️ 只有"真上传成功"才记账；--dry 试跑不记账（否则会把指令吃掉），失败也不记账（下轮重试）
-        if ok and not dry:
-            done[fid] = upd
+        # ⚠️ 指令执行过了就必须记账，**不管回执发没发出去**。
+        #    原来"失败就不记账、下轮重试"有个致命后果：回执通道一坏，
+        #    同一条指令每轮都被当成新指令重新执行（2026-10-25 连续 75 分钟）。
+        #    回执发不出去 → 进重试队列，后面几轮补发。
+        mark_handled(st, done, fid, upd, ok, title,
+                     "%s%s-%s" % (REPLY_PREFIX, title, now), text, dry)
 
     save_state(st)
     return 0

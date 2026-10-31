@@ -70,6 +70,27 @@ RULE = (222, 228, 234)
 
 FONT_REG = "C:/Windows/Fonts/msyh.ttc"
 FONT_BOLD = "C:/Windows/Fonts/msyhbd.ttc"
+# 缺字回退用的字体：微软雅黑没给下面这批符号定义字形，Segoe UI Symbol 全都有
+FONT_SYM = "C:/Windows/Fonts/seguisym.ttf"
+
+# 微软雅黑（msyh / msyhbd）**实测**缺失的数学符号，共 31 个。
+# 来源：2026-10-25 逐字核对（见桌面《备忘报错日志.txt》第 9 条）。
+#   上标 ⁰ ⁶ ⁹ / 下标 ₀₋₉ / ⁺ ⁻ / ∛ ∜ / ∉ ⊂ ⊆ ⊈ ∅ / ∀ ∃ / ⇒ ⇔ / ✓ ✗ ✔ ✘ / ≅
+#
+# ⚠️ 为什么硬编码而不是运行时检测字形：试过「拿私用区 U+E000 当缺字基准比对字模」，
+#    在微软雅黑上不成立（雅黑对 U+E000 的处理与缺字方块不同），结果把所有字都判成
+#    "有字形"，回退完全不生效，画出来全是方块。这份清单是逐字目测核对的，最可靠。
+FALLBACK_CHARS = frozenset(
+    "\u2070\u2076\u2079"                                     # 上标 0 6 9
+    "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089"   # 下标 0-9
+    "\u207a\u207b"                                            # ⁺ ⁻
+    "\u221b\u221c"                                            # ∛ ∜
+    "\u2209\u2282\u2286\u2288\u2205"                          # ∉ ⊂ ⊆ ⊈ ∅
+    "\u2200\u2203"                                            # ∀ ∃
+    "\u21d2\u21d4"                                            # ⇒ ⇔
+    "\u2713\u2717\u2714\u2718"                                # ✓ ✗ ✔ ✘
+    "\u2245"                                                  # ≅
+)
 
 
 # ------------------------------------------------------------------ 文本处理
@@ -123,6 +144,35 @@ def render_only():
                                             size, index=0)
         return _fcache[k]
 
+    # ---- 缺字回退 ----------------------------------------------------
+    # 微软雅黑缺一批数学符号（清单见文件顶部 FALLBACK_CHARS，共 31 个）。
+    # 缺字时 Pillow 会画一个空心方块，看着就像"乱码"（数学答案里尤其明显）。
+    # 做法：逐字画，命中清单的字符换 Segoe UI Symbol 画那一个。
+    _fb_cache = {}
+
+    def fallback_font(size):
+        if size not in _fb_cache:
+            try:
+                _fb_cache[size] = (ImageFont.truetype(FONT_SYM, size)
+                                   if os.path.exists(FONT_SYM) else None)
+            except Exception:
+                _fb_cache[size] = None
+        return _fb_cache[size]
+
+    def draw_mixed(d, x, y, text, bold, size, fill):
+        """逐字画，命中缺字清单的字符换备用字体。返回画完后的 x。"""
+        f = font(bold, size)
+        fb = fallback_font(size)
+        cx = x
+        for ch in text:
+            if fb is not None and ch in FALLBACK_CHARS:
+                d.text((cx, y), ch, font=fb, fill=fill)
+                cx += fb.getlength(ch)
+            else:
+                d.text((cx, y), ch, font=f, fill=fill)
+                cx += f.getlength(ch)
+        return cx
+
     max_w = PAGE_W - MARGIN_X * 2
 
     def wrap(runs, size):
@@ -171,7 +221,7 @@ def render_only():
     f_title = font(True, TITLE_SIZE)
     d.rounded_rectangle([MARGIN_X, TITLE_BAR_Y, MARGIN_X + 14, TITLE_BAR_Y + 70],
                         radius=7, fill=ACCENT)
-    d.text((MARGIN_X + 44, TITLE_BAR_Y - 8), title, font=f_title, fill=INK)
+    draw_mixed(d, MARGIN_X + 44, TITLE_BAR_Y - 8, title, True, TITLE_SIZE, INK)
     d.line([MARGIN_X, 196, PAGE_W - MARGIN_X, 196], fill=RULE, width=3)
 
     y = BODY_TOP
@@ -183,9 +233,8 @@ def render_only():
         for line in wrap(runs, chosen):
             x = MARGIN_X
             for txt, is_bold in line:
-                f = font(is_bold, chosen)
-                d.text((x, y), txt, font=f, fill=INK)
-                x += f.getlength(txt)
+                # 逐字画，缺字自动换备用字体（数学符号不再变方块）
+                x = draw_mixed(d, x, y, txt, is_bold, chosen, INK)
             y += line_h
         if i != len(paras) - 1:
             y += int(line_h * PARA_GAP)
@@ -259,6 +308,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只渲染，不上传（图丢桌面）")
     ap.add_argument("--out", help="配合 --dry-run：渲染到指定路径（不含扩展名）")
     ap.add_argument("--keep", action="store_true", help="上传后不回收本地渲染图")
+    ap.add_argument("--body-image", metavar="PATH",
+                    help="额外的页内真实图片（比如点击后的截图）；"
+                         "不传就用文字页面缩略图")
     args = ap.parse_args()
 
     if args.render_only:
@@ -311,9 +363,14 @@ def main():
         name = "AI回复-%s-%s" % (name, datetime.datetime.now().strftime("%m%d-%H%M"))
         print("[保险栓] 笔记名不以 AI回复 开头，已自动改为：%s" % name)
     cli = zy_client.build_client()
+    # 页内图：优先用调用方给的真实截图（点击后的复核图），没有就退回文字缩略图
+    body_img = args.body_image or jpg
+    if args.body_image and not os.path.exists(args.body_image):
+        print("[警告] --body-image 指的文件不存在，改用缩略图：%s" % args.body_image)
+        body_img = jpg
     res = zy_upload.upload_note_page(
         cli, png, name, parent_id=args.parent,
-        progress=lambda *a: None, body_image_path=jpg,
+        progress=lambda *a: None, body_image_path=body_img,
         keep_source=args.keep)
     print("已上传：%s\n%s" % (name, json.dumps(res, ensure_ascii=False, indent=2)))
     if res.get("recycledLocal"):

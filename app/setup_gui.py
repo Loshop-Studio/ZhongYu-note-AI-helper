@@ -74,6 +74,9 @@ def load_key():
     return ""
 
 
+CONFIG_SCHEMA = 2          # 必须和 control_bot.CONFIG_SCHEMA 一致
+MODE_NAMES = {"control": "仅控制", "chat": "普通模式", "full": "全功能"}
+
 def load_conf():
     d = {"mode": "control", "interval_min": 1}
     try:
@@ -83,7 +86,17 @@ def load_conf():
             d.update(got)
     except Exception:
         pass
-    if d.get("mode") not in ("control", "full"):
+    # 与 control_bot.migrate_config() 保持一致：
+    # 老版本的 "full" 真实含义是「关键词动作 + 聊天兜底」，也就是现在的
+    # 「普通模式(chat)」。这里只做内存迁移（不写盘，避免和常驻进程抢文件），
+    # 但保存时会把这个迁移结果落下去。
+    try:
+        ver = int(d.get("config_schema") or 0)
+    except Exception:
+        ver = 0
+    if ver < CONFIG_SCHEMA and str(d.get("mode") or "").lower() == "full":
+        d["mode"] = "chat"
+    if d.get("mode") not in ("control", "full", "chat"):
         d["mode"] = "control"
     try:
         d["interval_min"] = max(1, min(60, int(d.get("interval_min") or 1)))
@@ -93,8 +106,10 @@ def load_conf():
 
 
 THINK_OFF = "关（最快最省）"
-THINK_CHOICES = (THINK_OFF, "标准", "最高（最强也最慢）")
-THINK_MAP = {THINK_OFF: "off", "标准": "high", "最高（最强也最慢）": "max"}
+THINK_LOW = "低（快一些）"
+THINK_MAX = "最高（最强最慢，不限长度）"
+THINK_CHOICES = (THINK_OFF, THINK_LOW, "标准", THINK_MAX)
+THINK_MAP = {THINK_OFF: "off", THINK_LOW: "low", "标准": "high", THINK_MAX: "max"}
 THINK_BACK = {v: k for k, v in THINK_MAP.items()}
 
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -133,61 +148,11 @@ def set_autostart(on):
         return False, repr(e)
 
 
-GUARD_TASK = "云笔记遥控器守护"
-GUARD_BAT = os.path.join(BASE, "guard.bat")
-
-
-def guard_on():
-    """守护计划任务是否已存在"""
-    try:
-        r = subprocess.run(["schtasks", "/Query", "/TN", GUARD_TASK],
-                           capture_output=True, timeout=15,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _write_guard_bat():
-    """生成守护脚本：进程不在才把 exe 拉起来。
-
-    ⚠️ 为什么不让任务直接调 exe：exe 是 onefile，每次启动要解包 30MB（实测 20~25 秒），
-       每小时跑一次纯属浪费 IO。用 tasklist 先探一下只要 0.3 秒。
-    """
-    exe = os.path.abspath(sys.executable)
-    name = os.path.basename(exe)
-    lines = [
-        "@echo off",
-        'tasklist /FI "IMAGENAME eq %s" | find /I "%s" >nul 2>&1' % (name, name),
-        "if errorlevel 1 (",
-        '    start "" "%s" --guard' % exe,
-        ")",
-    ]
-    os.makedirs(BASE, exist_ok=True)
-    with open(GUARD_BAT, "w", encoding="gbk", newline="\r\n") as f:
-        f.write("\n".join(lines) + "\r\n")
-    return GUARD_BAT
-
-
-def set_guard(on):
-    """创建/删除守护计划任务（每小时跑一次 guard.bat）。返回 (成功, 说明)"""
-    if not getattr(sys, "frozen", False):
-        return False, "源码模式下不支持（任务会指向 python.exe）"
-    try:
-        if on:
-            bat = _write_guard_bat()
-            cmd = ["schtasks", "/Create", "/F", "/TN", GUARD_TASK,
-                   "/TR", '"%s"' % bat, "/SC", "HOURLY"]
-        else:
-            cmd = ["schtasks", "/Delete", "/F", "/TN", GUARD_TASK]
-        r = subprocess.run(cmd, capture_output=True, timeout=30,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if r.returncode == 0:
-            return True, ("每小时检查，挂了自动拉起" if on else "已移除")
-        err = (r.stderr or r.stdout or b"").decode("mbcs", "replace").strip()[:120]
-        return False, err or ("schtasks 返回 %d" % r.returncode)
-    except Exception as e:
-        return False, repr(e)
+# ---------------------------------------------------------------- 系统保护（守护）
+# 具体实现在 app/guard.py —— 设置界面和遥控器指令共用同一份，
+# 免得两边各写一遍，最后出现「界面说开着、指令说关着」这种割裂。
+from guard import (guard_on, set_guard,            # noqa: E402,F401
+                   GUARD_TASK, GUARD_FLAG, GUARD_EVERY_MIN)
 
 
 def _pids_of(exe_name):
@@ -233,12 +198,68 @@ def _ago(sec):
     return "%.1f 小时" % (sec / 3600.0)
 
 
+class SymbolCheck(tk.Frame):
+    """用方块字符当勾选框：选中 ■、未选 □。
+
+    为什么不用 ttk.Checkbutton：`clam` 主题把选中标记画成一个**大叉 ✗**，
+    又丑又看不清（用户 2026-10-31 反馈"这个 X 也太厉害了吧"）。
+    ttk 的 indicator 形状由主题决定，改不了，所以干脆自己画。
+    """
+
+    def __init__(self, parent, text, variable, command=None, wraplength=330):
+        bg = parent.cget("bg") if "bg" in parent.keys() else "#1e1e1e"
+        super().__init__(parent, bg=bg)
+        self.var = variable
+        self._cmd = command
+        self._bg = bg
+        self.mark = tk.Label(self, text="", bg=bg,
+                             font=("Microsoft YaHei UI", 12), cursor="hand2")
+        self.mark.pack(side="left", anchor="n")
+        # wraplength：窗口只有 600 出头，长说明（比如联网搜索那条）靠换行消化
+        self.lab = tk.Label(self, text=text, bg=bg, fg="#e6e6e6", anchor="w",
+                            justify="left", wraplength=wraplength,
+                            font=("Microsoft YaHei UI", 10), cursor="hand2")
+        self.lab.pack(side="left", padx=(5, 0))
+        for w in (self, self.mark, self.lab):
+            w.bind("<Button-1>", self._toggle)
+        # ⚠️ 必须监听变量变化：ttk.Checkbutton 会自动跟着 variable 走，
+        #    自己画的 Label 不会 —— 不监听的话 `v.set(1)` 之后方块还停在 □
+        #    （2026-10-31 实测：文字显示"开"、方块却是空的）。
+        try:
+            self.var.trace_add("write", lambda *_a: self._refresh())
+        except Exception:
+            pass
+        self._refresh()
+
+    def _refresh(self):
+        on = bool(self.var.get())
+        # ■/□ 在雅黑里都有字形，不会变方块乱码（比 ✔ 靠谱）
+        self.mark.configure(text="■" if on else "□",
+                            fg="#4ec9b0" if on else "#8a8a8a")
+
+    def _toggle(self, _e=None):
+        self.var.set(0 if self.var.get() else 1)
+        self._refresh()
+        if self._cmd:
+            self._cmd()
+
+    def set_text(self, text):
+        """只改文字，勾选标记照旧（替代 Checkbutton 的 configure(text=)）"""
+        self.lab.configure(text=text)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("云笔记遥控器 · 设置")
-        self.geometry("600x720")
-        self.minsize(560, 660)
+        # 宽度保持和原来一样（600 出头），内容长了靠**换行 + 滚动**消化，
+        # 不靠把窗口拉宽（用户 2026-10-31："宽度太厉害了，跟原来一样，多换换行"）。
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(620, max(560, sw - 200))
+        h = max(520, min(900, sh - 120))
+        self.geometry("%dx%d" % (w, h))
+        self.minsize(560, 460)
         self.configure(bg="#1e1e1e")
         self.q = queue.Queue()
         self._build()
@@ -260,11 +281,48 @@ class App(tk.Tk):
                      foreground="#4ec9b0")
         st.configure("TFrame", background="#1e1e1e")
         st.configure("TButton", font=("Microsoft YaHei UI", 10))
-        st.configure("TEntry", fieldbackground="#2b2b2b", foreground="#e6e6e6")
+        st.configure("TEntry", fieldbackground="#2b2b2b", foreground="#e6e6e6",
+                     insertcolor="#e6e6e6", selectbackground="#264f78")
+        # ⚠️ TEntry 的样式**不会**自动套到 Spinbox / Combobox 上。
+        #    不单独设的话它们用 clam 默认的浅灰底，在深色主题里几乎看不清字
+        #    （用户 2026-10-31 截图反馈"文字都看不见"）。
+        for _sty in ("TSpinbox", "TCombobox"):
+            st.configure(_sty, fieldbackground="#2b2b2b", foreground="#e6e6e6",
+                         background="#343434", arrowcolor="#d8d8d8",
+                         insertcolor="#e6e6e6", bordercolor="#4a4a4a",
+                         lightcolor="#4a4a4a", darkcolor="#4a4a4a")
+        # readonly 状态的 Combobox 用的是另一套颜色，要单独映射，否则是灰底黑字
+        st.map("TCombobox",
+               fieldbackground=[("readonly", "#2b2b2b")],
+               foreground=[("readonly", "#e6e6e6")],
+               selectbackground=[("readonly", "#2b2b2b")],
+               selectforeground=[("readonly", "#e6e6e6")])
+        # 下拉弹出的列表不走 ttk style，只能设进 option 数据库
+        self.option_add("*TCombobox*Listbox.background", "#2b2b2b")
+        self.option_add("*TCombobox*Listbox.foreground", "#e6e6e6")
+        self.option_add("*TCombobox*Listbox.selectBackground", "#264f78")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
         pad = {"padx": 18, "pady": 4}
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True, pady=8)
+        # ---- 滚动容器 ----------------------------------------------------
+        # 内容实测需要 709×975，而小屏幕（或系统开了 125%/150% 缩放）往往只有
+        # 800 出头的高度，直接 pack 会把底部的按钮裁掉（用户 2026-10-31 反馈"有遮挡"）。
+        # 所以整页塞进 Canvas，高度不够就滚动，怎么都能看全。
+        outer = ttk.Frame(self)
+        self._canvas = tk.Canvas(outer, bg="#1e1e1e", highlightthickness=0,
+                                 bd=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        root = ttk.Frame(self._canvas)
+        self._canvas.create_window((0, 0), window=root, anchor="nw", tags="inner")
+        root.bind("<Configure>", self._sync_scroll)
+        # 画布自己变宽时也要重新同步（否则只靠 root 的 Configure 永远等不到）
+        self._canvas.bind("<Configure>", self._sync_scroll)
+        self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.after_idle(self._sync_scroll)
 
         ttk.Label(root, text="云笔记遥控器", style="H.TLabel").pack(anchor="w", **pad)
         ttk.Label(root, text="填好两项就能用，保存后立即生效",
@@ -332,74 +390,88 @@ class App(tk.Tk):
         self.v_guard = tk.IntVar(value=0)
 
         ttk.Label(box3, text="检查频率").grid(row=0, column=0, sticky="e",
-                                              padx=(10, 8), pady=5)
-        ttk.Spinbox(box3, from_=1, to=60, width=5,
+                                              padx=(10, 8), pady=(8, 1))
+        ttk.Spinbox(box3, from_=1, to=60, width=6,
                     textvariable=self.v_interval).grid(row=0, column=1,
-                                                       sticky="w", pady=5)
-        ttk.Label(box3, text="分钟一次（1~60，越短登录越频繁）",
-                  foreground="#9a9a9a").grid(row=0, column=2, sticky="w", padx=6)
+                                                       sticky="w", pady=(8, 1))
+        ttk.Label(box3, text="分钟一次（1~60，越短登录越频繁）", foreground="#9a9a9a",
+                  wraplength=420).grid(row=1, column=0, columnspan=5,
+                                       sticky="w", padx=(24, 10), pady=(0, 6))
 
-        ttk.Label(box3, text="回答上限").grid(row=0, column=3, sticky="e",
-                                              padx=(18, 8))
-        ttk.Spinbox(box3, from_=200, to=8000, increment=100, width=7,
-                    textvariable=self.v_maxtok).grid(row=0, column=4,
-                                                     sticky="w", pady=5)
-        ttk.Label(box3, text="token（越大越长、越费钱）",
-                  foreground="#9a9a9a").grid(row=0, column=5, sticky="w", padx=6)
+        ttk.Label(box3, text="回答上限").grid(row=2, column=0, sticky="e",
+                                              padx=(10, 8), pady=(4, 1))
+        ttk.Spinbox(box3, from_=200, to=8000, increment=100, width=8,
+                    textvariable=self.v_maxtok).grid(row=2, column=1,
+                                                     sticky="w", pady=(4, 1))
+        ttk.Label(box3, text="token（越大越长、越费钱）", foreground="#9a9a9a",
+                  wraplength=420).grid(row=3, column=0, columnspan=5,
+                                       sticky="w", padx=(24, 10), pady=(0, 6))
 
-        ttk.Label(box3, text="模式").grid(row=1, column=0, sticky="e",
-                                          padx=(10, 8), pady=5)
+        ttk.Label(box3, text="模式").grid(row=4, column=0, sticky="e",
+                                          padx=(10, 8), pady=(6, 1))
         mf = ttk.Frame(box3)
-        mf.grid(row=1, column=1, columnspan=2, sticky="w")
+        mf.grid(row=4, column=1, columnspan=4, sticky="w", pady=(6, 1))
         ttk.Radiobutton(mf, text="仅控制", value="control",
                         variable=self.v_mode).pack(side="left")
+        ttk.Radiobutton(mf, text="普通模式", value="chat",
+                        variable=self.v_mode).pack(side="left", padx=(16, 0))
         ttk.Radiobutton(mf, text="全功能", value="full",
-                        variable=self.v_mode).pack(side="left", padx=(14, 0))
+                        variable=self.v_mode).pack(side="left", padx=(16, 0))
+        ttk.Label(box3, text="全功能 = agent 模式，一句话能组合多个动作\n（更费钱、慢几秒）",
+                  foreground="#9a9a9a").grid(
+                      row=5, column=0, columnspan=5, sticky="w",
+                      padx=(24, 10), pady=(0, 8))
 
-        ttk.Label(box3, text="仅控制：只认指令，不聊天不答题　｜　全功能：还能问答、聊天",
-                  foreground="#9a9a9a").grid(row=2, column=1, columnspan=2,
-                                             sticky="w", pady=(0, 6))
+        self.cb_search = SymbolCheck(
+            box3, self._search_label(), self.v_search, self._on_search_toggle)
+        self.cb_search.grid(row=6, column=1, columnspan=4, sticky="w", pady=4)
 
-        self.cb_search = ttk.Checkbutton(
-            box3, text=self._search_label(),
-            variable=self.v_search, command=self._on_search_toggle)
-        self.cb_search.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        self.cb_auto = SymbolCheck(
+            box3, self._auto_label(), self.v_auto, self._on_auto_toggle)
+        self.cb_auto.grid(row=7, column=1, columnspan=4, sticky="w", pady=4)
 
-        self.cb_auto = ttk.Checkbutton(
-            box3, text=self._auto_label(),
-            variable=self.v_auto, command=self._on_auto_toggle)
-        self.cb_auto.grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        self.cb_guard = SymbolCheck(
+            box3, self._guard_label(), self.v_guard, self._on_guard_toggle)
+        self.cb_guard.grid(row=8, column=1, columnspan=4, sticky="w", pady=4)
 
-        self.cb_guard = ttk.Checkbutton(
-            box3, text=self._guard_label(),
-            variable=self.v_guard, command=self._on_guard_toggle)
-        self.cb_guard.grid(row=5, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(box3, text="思考强度").grid(row=9, column=0, sticky="e",
+                                              padx=(10, 8), pady=(8, 1))
+        ttk.Combobox(box3, textvariable=self.v_think, state="readonly", width=22,
+                     values=THINK_CHOICES).grid(row=9, column=1, columnspan=2,
+                                                sticky="w", pady=(8, 1))
+        ttk.Label(box3, text="越强越准也越慢越贵；选「最高」时不限回答长度\n看图始终不思考",
+                  foreground="#9a9a9a").grid(
+                      row=10, column=0, columnspan=5, sticky="w",
+                      padx=(24, 10), pady=(0, 8))
 
-        ttk.Label(box3, text="思考强度").grid(row=6, column=0, sticky="e",
-                                              padx=(10, 8), pady=5)
-        ttk.Combobox(box3, textvariable=self.v_think, state="readonly", width=18,
-                     values=THINK_CHOICES).grid(row=6, column=1, columnspan=2,
-                                                sticky="w", pady=5)
-        ttk.Label(box3, text="开思考更准，但更慢也更费钱",
-                  foreground="#9a9a9a").grid(row=6, column=3, columnspan=3,
-                                             sticky="w", padx=6)
+        # --- 按钮：固定在窗口底部，不跟着内容滚
+        # ⚠️ 必须**先 pack 底部按钮、最后 pack 滚动区**，否则 expand 的滚动区
+        #    会先吃掉全部空间，按钮就被挤出去看不见了。
+        # 危险操作放最底下一行、字号小一号、靠右 —— 别让它长得像普通按钮。
+        bar3 = ttk.Frame(self)
+        bar3.pack(side="bottom", fill="x", padx=18, pady=(2, 8))
+        tk.Button(bar3, text="全部关闭退出", command=self.on_quit_all,
+                  bg="#8c1d18", fg="#f0c4c0", activebackground="#b3261e",
+                  activeforeground="#ffffff", relief="flat", bd=0,
+                  padx=8, pady=1, cursor="hand2",
+                  font=("Microsoft YaHei UI", 8)).pack(side="right")
 
-        # --- 按钮
-        bar = ttk.Frame(root)
-        bar.pack(fill="x", padx=18, pady=(10, 4))
+        bar2 = ttk.Frame(self)
+        bar2.pack(side="bottom", fill="x", padx=18, pady=(4, 0))
+        ttk.Button(bar2, text="关闭窗口", command=self.destroy).pack(side="left")
+
+        bar = ttk.Frame(self)
+        bar.pack(side="bottom", fill="x", padx=18, pady=(8, 0))
         ttk.Button(bar, text="测试连接", command=self.on_test).pack(side="left")
-        ttk.Button(bar, text="保存", command=self.on_save).pack(side="left", padx=8)
+        ttk.Button(bar, text="保存", command=self.on_save).pack(side="left", padx=6)
         ttk.Button(bar, text="保存并测试",
                    command=lambda: (self.on_save(), self.on_test())
                    ).pack(side="left")
         ttk.Button(bar, text="提示词…",
-                   command=self.on_edit_prompt).pack(side="left", padx=8)
-        tk.Button(bar, text="全部关闭退出", command=self.on_quit_all,
-                  bg="#b3261e", fg="white", activebackground="#8c1d18",
-                  activeforeground="white", relief="flat", padx=12, pady=2,
-                  cursor="hand2",
-                  font=("Microsoft YaHei UI", 9)).pack(side="right")
-        ttk.Button(bar, text="关闭窗口", command=self.destroy).pack(side="right", padx=8)
+                   command=self.on_edit_prompt).pack(side="left", padx=6)
+
+        # 最后才让滚动区占满剩下的空间
+        outer.pack(fill="both", expand=True)
 
         ttk.Label(root,
                   text="关闭窗口不会停用遥控器；要停用请双击桌面「云笔记遥控器 开关」",
@@ -434,13 +506,13 @@ class App(tk.Tk):
                        (getattr(self, "cb_guard", None), self._guard_label)):
             try:
                 if cb is not None:
-                    cb.configure(text=fn())
+                    cb.set_text(fn())
             except Exception:
                 pass
         if c.get("userName"):
             self.log("已读取现有配置（账号 %s，每 %d 分钟检查，%s）"
                      % (c.get("userName"), cf.get("interval_min", 1),
-                        "仅控制" if cf.get("mode") == "control" else "全功能"))
+                        MODE_NAMES.get(cf.get("mode"), "仅控制")))
 
     def _collect(self):
         return {
@@ -456,6 +528,26 @@ class App(tk.Tk):
     def _ui(self, fn):
         self.q.put(fn)
 
+    def _sync_scroll(self, _e=None):
+        """内容尺寸变化时刷新滚动范围，并让内层跟随画布宽度。
+
+        ⚠️ 必须在画布**已经布局**（宽度 > 100）时才写 width，
+           否则首次触发拿到的是 1，会把整页挤成 1px 宽（内容全看不见）。
+        """
+        try:
+            cw = self._canvas.winfo_width()
+            if cw > 100:
+                self._canvas.itemconfigure("inner", width=cw)
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_wheel(self, e):
+        try:
+            self._canvas.yview_scroll(int(-e.delta / 120), "units")
+        except Exception:
+            pass
+
     def _poll(self):
         try:
             while True:
@@ -466,8 +558,8 @@ class App(tk.Tk):
         self.after(120, self._poll)
 
     def _guard_label(self):
-        return "系统保护：%s（每小时检查一次，没开着就自动拉起）" % (
-            "开" if self.v_guard.get() else "关")
+        return ("系统保护：%s\n每 %d 分钟检查，挂了自动拉起" 
+                % ("开" if self.v_guard.get() else "关", GUARD_EVERY_MIN))
 
     def _on_guard_toggle(self):
         on = bool(self.v_guard.get())
@@ -478,7 +570,7 @@ class App(tk.Tk):
         else:
             self.log("[OK] 系统保护：%s（%s）" % ("已开启" if on else "已关闭", info))
         try:
-            self.cb_guard.configure(text=self._guard_label())
+            self.cb_guard.set_text(self._guard_label())
         except Exception:
             pass
 
@@ -494,7 +586,7 @@ class App(tk.Tk):
         else:
             self.log("[OK] 开机自启动：%s（%s）" % ("已开启" if on else "已关闭", info))
         try:
-            self.cb_auto.configure(text=self._auto_label())
+            self.cb_auto.set_text(self._auto_label())
         except Exception:
             pass
 
@@ -502,11 +594,12 @@ class App(tk.Tk):
         """文字里直接写明开/关 —— 不依赖那个小方块的渲染
         （某些 Windows 主题下未勾选的框会画成一个叉，很容易误读）"""
         on = bool(self.v_search.get())
-        return "联网搜索：%s　（发「搜索 xxx」时用，每次约 5 厘钱）" % ("开" if on else "关")
+        return ("联网搜索：%s\n（发「/搜索 xxx」时用，每次约 5 厘钱）"
+                % ("开" if on else "关"))
 
     def _on_search_toggle(self):
         try:
-            self.cb_search.configure(text=self._search_label())
+            self.cb_search.set_text(self._search_label())
         except Exception:
             pass
 
@@ -579,6 +672,7 @@ class App(tk.Tk):
         try:
             cur = load_conf()               # 先读原配置，别把别的字段冲掉
             cur["mode"] = mode
+            cur["config_schema"] = CONFIG_SCHEMA   # 标记已是新结构，别再迁移
             cur["interval_min"] = n
             cur["web_search"] = bool(self.v_search.get())
             try:
@@ -590,7 +684,9 @@ class App(tk.Tk):
             with open(CONF, "w", encoding="utf-8") as f:
                 json.dump(cur, f, ensure_ascii=False, indent=2)
             self.log("运行设置：每 %d 分钟检查一次，%s"
-                     % (n, "仅控制" if mode == "control" else "全功能"))
+                     % (n, MODE_NAMES.get(mode, "仅控制")
+                        + ("（agent 模式，每条指令都会调 DeepSeek）"
+                           if mode == "full" else "")))
         except Exception as e:
             self.log("！运行设置保存失败：%r" % (e,))
             return
@@ -648,12 +744,12 @@ class App(tk.Tk):
             self.log("！同步计划任务失败：%r" % (e,))
 
     def on_edit_prompt(self):
-        """二级窗口：编辑「全功能」模式的聊天提示词"""
+        """二级窗口：编辑「普通模式」下聊天用的提示词"""
         import control_bot as _CB
         default = _CB.CHAT_SYSTEM
 
         win = tk.Toplevel(self)
-        win.title("编辑全功能提示词")
+        win.title("编辑聊天提示词")
         win.geometry("680x560")
         win.configure(bg="#1e1e1e")
         try:
@@ -663,8 +759,8 @@ class App(tk.Tk):
 
         ttk.Label(
             win, justify="left",
-            text=("这段提示词只在「全功能」模式下用于聊天和问答。\n"
-                  "「仅控制」模式不调用模型，用不到它。\n"
+            text=("这段提示词只在「普通模式」下聊天时用。\n"
+                  "「仅控制」完全不调模型；「全功能(agent)」用的是另一套内置调度提示词。\n"
                   "留空（或与默认一致）= 使用内置默认。"),
             foreground="#9a9a9a").pack(anchor="w", padx=16, pady=(14, 8))
 
@@ -724,13 +820,15 @@ class App(tk.Tk):
         from tkinter import messagebox
 
         if not messagebox.askyesno(
-                "全部关闭退出",
-                "要完全停止遥控器吗？\n\n"
+                "⚠ 确认全部关闭？",
+                "这一步会把遥控器**彻底停掉**，不是关窗口：\n\n"
                 "· 托盘图标消失，后台巡检停止\n"
-                "· 平板上的指令不会再被处理\n"
-                "· 这个窗口也会关掉\n\n"
-                "（只想关窗口的话，请点「关闭窗口」）",
-                parent=self):
+                "· 平板上发指令不会再有任何反应\n"
+                "· 这个设置窗口也会一起关掉\n\n"
+                "确认要停，就点「是」。\n"
+                "只是想关掉这个窗口的话，点「关闭窗口」就行。",
+                parent=self, icon="warning", default="no"):
+            self.log("已取消「全部关闭退出」")
             return
 
         if not getattr(sys, "frozen", False):
